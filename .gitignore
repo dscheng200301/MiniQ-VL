@@ -1,0 +1,46 @@
+# Models & weights
+model/
+out/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Datasets
+dataset/eval_images/
+dataset/*.parquet
+dataset/minimind-v_dataset/
+
+# Evaluation output
+eval_output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets & keys
+*.env
+*.key
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Wandb
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+images/

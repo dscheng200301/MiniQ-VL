@@ -1,0 +1,22 @@
+# Core
+torch>=2.5.0
+transformers>=4.50.0
+accelerate>=1.0.0
+
+# Data
+pyarrow>=15.0.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Training
+tqdm>=4.66.0
+wandb>=0.18.0
+
+# GRPO Reward
+openai>=1.0.0
+
+# Utilities
+einops>=0.8.0
+
+# Download
+modelscope>=1.20.0
