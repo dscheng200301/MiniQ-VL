@@ -1,5 +1,7 @@
 # Models & weights
-model/
+model/*
+!model/__init__.py
+!model/qwen_vl.py
 out/
 checkpoints/
 *.pt

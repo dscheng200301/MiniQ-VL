@@ -214,7 +214,7 @@ def build_chat_input(processor, image, prompt_text, max_length=2048):
     inputs = processor(
         text=text,
         images=[image],
-        padding='max_length',
+        padding=False,
         max_length=max_length,
         truncation=True,
         return_tensors="pt",
@@ -255,18 +255,16 @@ def sample_group(raw_model, processor, prompt_input, group_size, gen_kwargs, dev
     if thw is not None:
         gen_inputs['image_grid_thw'] = thw.to(device)
 
-    out = raw_model.generate(**gen_inputs)
-    # out: [1, L_full] - batch=1
-    full_ids = out[0].cpu()
-    response_ids = full_ids[prompt_len:]
-    response_text = processor.tokenizer.decode(response_ids, skip_special_tokens=True)
-
-    # 同一 prompt 共享 response, 但 group 视角下需要 K 份
-    return [{
-        'text': response_text,
-        'full_ids': full_ids,
-        'prompt_len': prompt_len,
-    } for _ in range(group_size)]
+    results = []
+    for _ in range(group_size):
+        full_ids = raw_model.generate(**gen_inputs)[0].cpu()
+        response_ids = full_ids[prompt_len:]
+        results.append({
+            'text': processor.tokenizer.decode(response_ids, skip_special_tokens=True),
+            'full_ids': full_ids,
+            'prompt_len': prompt_len,
+        })
+    return results
 
 
 # ============================================================
@@ -944,7 +942,7 @@ def train_main(args, state):
                 train_sampler.set_epoch(epoch)
             setup_seed(args.seed + epoch)
 
-            indices = list(range(len(train_ds)))
+            indices = list(iter(train_sampler)) if train_sampler is not None else list(range(len(train_ds)))
             skip = start_step if (epoch == start_epoch and start_step > 0) else 0
             batch_sampler = SkipBatchSampler(indices, args.batch_size, skip)
 

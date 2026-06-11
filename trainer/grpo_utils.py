@@ -562,7 +562,7 @@ def compute_advantages(
 
     rewards_2d = rewards.view(-1, group_size)  # [N, K]
     mean = rewards_2d.mean(dim=1, keepdim=True)
-    std = rewards_2d.std(dim=1, keepdim=True)
+    std = rewards_2d.std(dim=1, keepdim=True, unbiased=False)
     advantages_2d = (rewards_2d - mean) / (std + eps)
     return advantages_2d.view(-1)
 
