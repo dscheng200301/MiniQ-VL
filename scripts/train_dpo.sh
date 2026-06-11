@@ -1,10 +1,16 @@
 #!/bin/bash
 # MiniQ-VL DPO 训练脚本
 
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_DIR"
+
 # 默认参数
 MODEL_PATH="${MODEL_PATH:-./model/Qwen3-VL-2B-Instruct}"
 SAVE_DIR="${SAVE_DIR:-./out}"
 DATA_PATH="${DATA_PATH:-./dataset/minimind-v_dataset/dpo_i2t.json}"
+SFT_CHECKPOINT="${SFT_CHECKPOINT:-./out/sft_vlm_merged}"
 EPOCHS="${EPOCHS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 LEARNING_RATE="${LEARNING_RATE:-5e-6}"
@@ -33,6 +39,7 @@ CMD="torchrun --standalone --nproc_per_node=$NUM_GPUS trainer/train_dpo.py \
     --model_path $MODEL_PATH \
     --save_dir $SAVE_DIR \
     --data_path $DATA_PATH \
+    --sft_checkpoint $SFT_CHECKPOINT \
     --epochs $EPOCHS \
     --batch_size $BATCH_SIZE \
     --learning_rate $LEARNING_RATE \

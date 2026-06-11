@@ -8,7 +8,7 @@
 set -euo pipefail
 
 # ============== 项目路径（一般无需修改） ==============
-PROJECT_DIR="/root/autodl-tmp/MiniQ-VL"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR" || { echo "项目目录不存在: $PROJECT_DIR"; exit 1; }
 
 # ============== 可调参数（按需修改） ==============

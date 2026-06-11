@@ -18,6 +18,7 @@ import traceback
 import argparse
 import warnings
 import base64
+import copy
 from datetime import datetime
 
 __package__ = "trainer"
@@ -107,77 +108,62 @@ class DPODataset(Dataset):
         except Exception:
             return Image.new('RGB', (224, 224))
     
+    def _encode(self, prompt, response, image):
+        user_content = [
+            {"type": "image", "image": image},
+            {"type": "text", "text": prompt},
+        ]
+        prompt_messages = [{"role": "user", "content": user_content}]
+        full_messages = prompt_messages + [{"role": "assistant", "content": response}]
+
+        prompt_text = self.processor.tokenizer.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True,
+        )
+        full_text = self.processor.tokenizer.apply_chat_template(
+            full_messages, tokenize=False, add_generation_prompt=False,
+        )
+        prompt_inputs = self.processor(
+            text=[prompt_text], images=[image], truncation=True,
+            max_length=self.max_length, return_tensors="pt",
+        )
+        inputs = self.processor(
+            text=[full_text], images=[image], padding="max_length",
+            truncation=True, max_length=self.max_length, return_tensors="pt",
+        )
+
+        prompt_len = min(int(prompt_inputs["attention_mask"].sum()), self.max_length)
+        valid_len = int(inputs["attention_mask"].sum())
+        response_mask = torch.zeros(self.max_length, dtype=torch.long)
+        response_mask[prompt_len:valid_len] = 1
+        return inputs, response_mask
+
     def __getitem__(self, index):
         item = self.data[index]
         prompt = item['prompt']
-        chosen = item['chosen']
-        rejected = item['rejected']
         image_b64 = item.get('image_bytes', '')
-        
-        # 加载图像
-        if image_b64:
-            try:
-                img = self._load_image(image_b64)
-            except Exception:
-                img = Image.new('RGB', (224, 224))
-        else:
-            img = Image.new('RGB', (224, 224))
-        
-        # 构建 chosen 和 rejected 的完整文本
-        chosen_text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{chosen}<|im_end|>"
-        rejected_text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{rejected}<|im_end|>"
-        
-        # 构建消息（用于获取图像相关的 tensor）
-        messages = [
-            {"role": "user", "content": [
-                {"type": "image", "image": img},
-                {"type": "text", "text": prompt}
-            ]}
-        ]
-        
-        # 获取图像相关 tensor
-        try:
-            vision_inputs = self.processor(
-                text=[messages[0]["content"]],
-                images=[[img]],
-                return_tensors="pt"
-            )
-            pixel_values = vision_inputs.get('pixel_values')
-            image_grid_thw = vision_inputs.get('image_grid_thw')
-            mm_token_type_ids = vision_inputs.get('mm_token_type_ids')
-            
-            # 确保 image_grid_thw 格式正确
-            if image_grid_thw is not None and image_grid_thw.dim() == 1:
-                image_grid_thw = image_grid_thw.unsqueeze(0)
-        except Exception:
-            pixel_values = None
-            image_grid_thw = None
-            mm_token_type_ids = None
-        
-        # Tokenize chosen 和 rejected
-        chosen_inputs = self.processor.tokenizer(
-            chosen_text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        rejected_inputs = self.processor.tokenizer(
-            rejected_text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
+        img = self._load_image(image_b64) if image_b64 else Image.new('RGB', (224, 224))
+
+        chosen_inputs, chosen_response_mask = self._encode(prompt, item['chosen'], img)
+        rejected_inputs, rejected_response_mask = self._encode(prompt, item['rejected'], img)
+
+        image_grid_thw = chosen_inputs.get('image_grid_thw')
+        if image_grid_thw is not None and image_grid_thw.dim() == 1:
+            image_grid_thw = image_grid_thw.unsqueeze(0)
+
+        mm_token_type_ids = chosen_inputs.get('mm_token_type_ids')
+        if mm_token_type_ids is None:
+            image_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            mm_token_type_ids = (chosen_inputs['input_ids'] == image_token_id).long()
+
         return {
             'prompt': prompt,
             'chosen_ids': chosen_inputs['input_ids'].squeeze(0),
             'chosen_mask': chosen_inputs['attention_mask'].squeeze(0),
+            'chosen_response_mask': chosen_response_mask,
             'rejected_ids': rejected_inputs['input_ids'].squeeze(0),
             'rejected_mask': rejected_inputs['attention_mask'].squeeze(0),
-            'pixel_values': pixel_values,
+            'rejected_response_mask': rejected_response_mask,
+            'pixel_values': chosen_inputs.get('pixel_values'),
             'image_grid_thw': image_grid_thw,
             'mm_token_type_ids': mm_token_type_ids,
         }
@@ -199,8 +185,10 @@ def dpo_collate_fn(batch):
         'prompt': [b['prompt'] for b in batch],
         'chosen_ids': torch.stack([b['chosen_ids'] for b in batch]),
         'chosen_mask': torch.stack([b['chosen_mask'] for b in batch]),
+        'chosen_response_mask': torch.stack([b['chosen_response_mask'] for b in batch]),
         'rejected_ids': torch.stack([b['rejected_ids'] for b in batch]),
         'rejected_mask': torch.stack([b['rejected_mask'] for b in batch]),
+        'rejected_response_mask': torch.stack([b['rejected_response_mask'] for b in batch]),
         'pixel_values': pixel_values,
         'image_grid_thw': image_grid_thw,
         'mm_token_type_ids': mm_token_type_ids,
@@ -211,8 +199,10 @@ def dpo_collate_fn(batch):
 
 def compute_dpo_loss(
     model,
+    ref_model,
     chosen_ids, chosen_mask,
     rejected_ids, rejected_mask,
+    chosen_response_mask, rejected_response_mask,
     pixel_values=None,
     image_grid_thw=None,
     mm_token_type_ids=None,
@@ -220,10 +210,7 @@ def compute_dpo_loss(
 ):
     """计算 DPO 损失"""
     # 构建模型输入参数
-    model_kwargs = {
-        'attention_mask': None,  # 不传 attention_mask，使用内部计算
-        'use_cache': False
-    }
+    model_kwargs = {'use_cache': False}
     
     if pixel_values is not None:
         model_kwargs['pixel_values'] = pixel_values
@@ -233,10 +220,10 @@ def compute_dpo_loss(
         model_kwargs['mm_token_type_ids'] = mm_token_type_ids
     
     # 计算 log probabilities
-    def get_logps(ids, mask):
+    def get_logps(target_model, ids, mask, response_mask):
         model_kwargs['input_ids'] = ids
-        
-        outputs = model(**model_kwargs)
+        model_kwargs['attention_mask'] = mask
+        outputs = target_model(**model_kwargs)
         logits = outputs.logits  # [batch, seq_len, vocab]
         
         # 计算 log probs
@@ -244,7 +231,7 @@ def compute_dpo_loss(
         
         # 移位：预测下一个 token
         target_ids = ids[:, 1:]  # [batch, seq_len-1]
-        target_mask = mask[:, 1:]  # [batch, seq_len-1]
+        target_mask = response_mask[:, 1:].to(log_probs.dtype)
         
         # gather 操作
         batch_size, seq_len_minus_1, vocab_size = log_probs.shape
@@ -262,19 +249,27 @@ def compute_dpo_loss(
         # 应用 mask
         target_log_probs = target_log_probs * target_mask
         
-        # 计算序列 log prob
-        valid_tokens = target_mask.sum(dim=1)  # [batch]
-        seq_logps = target_log_probs.sum(dim=1) / (valid_tokens + 1e-8)  # [batch]
-        
-        return seq_logps
-    
-    chosen_logps = get_logps(chosen_ids, chosen_mask)
-    rejected_logps = get_logps(rejected_ids, rejected_mask)
-    
-    # DPO 损失
-    logits = beta * (chosen_logps - rejected_logps)
-    loss = -F.logsigmoid(logits).mean()
-    
+        return target_log_probs.sum(dim=1)
+
+    chosen_logps = get_logps(model, chosen_ids, chosen_mask, chosen_response_mask)
+    rejected_logps = get_logps(model, rejected_ids, rejected_mask, rejected_response_mask)
+
+    with torch.no_grad():
+        if ref_model is not None:
+            ref_chosen_logps = get_logps(
+                ref_model, chosen_ids, chosen_mask, chosen_response_mask
+            )
+            ref_rejected_logps = get_logps(
+                ref_model, rejected_ids, rejected_mask, rejected_response_mask
+            )
+        else:
+            ref_chosen_logps = torch.zeros_like(chosen_logps)
+            ref_rejected_logps = torch.zeros_like(rejected_logps)
+
+    policy_margin = chosen_logps - rejected_logps
+    reference_margin = ref_chosen_logps - ref_rejected_logps
+    loss = -F.logsigmoid(beta * (policy_margin - reference_margin)).mean()
+
     return loss, chosen_logps.mean(), rejected_logps.mean()
 
 
@@ -300,14 +295,23 @@ def train(args):
     with open(config_path, 'w') as f:
         json.dump(vars(args), f, indent=2)
     
-    # 加载模型
-    model_path = resolve_path(args.model_path)
+    # A merged SFT directory is a complete Hugging Face model and should be
+    # loaded directly. Loading its inner state dict into the wrapper would
+    # silently miss every key because of the wrapper's "model." prefix.
+    sft_path = resolve_path(args.sft_checkpoint)
+    merged_sft_dir = (
+        sft_path if sft_path and os.path.isdir(sft_path)
+        and os.path.exists(os.path.join(sft_path, "config.json"))
+        else None
+    )
+    model_path = merged_sft_dir or resolve_path(args.model_path)
     config = QwenVLMConfig(model_path=model_path)
     model = QwenVLM(config).to(device)
     
     # 加载 SFT 权重
-    sft_path = resolve_path(args.sft_checkpoint)
-    if sft_path and os.path.exists(sft_path):
+    if merged_sft_dir:
+        print(f"[Rank {local_rank}] Loaded merged SFT model from {merged_sft_dir}")
+    elif sft_path and os.path.exists(sft_path):
         try:
             if os.path.isdir(sft_path):
                 model_file = os.path.join(sft_path, "model.safetensors")
@@ -330,9 +334,6 @@ def train(args):
         except Exception as e:
             print(f"[Rank {local_rank}] Failed to load SFT: {e}")
     
-    if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank])
-    
     # 冻结策略
     if args.freeze_vision:
         for name, param in unwrap_model(model).named_parameters():
@@ -343,10 +344,19 @@ def train(args):
         for name, param in unwrap_model(model).named_parameters():
             if 'visual' not in name and 'vit' not in name and 'vision' not in name:
                 param.requires_grad = False
+
+    ref_model = None
+    if args.use_ref_model:
+        ref_model = copy.deepcopy(model).eval()
+        for param in ref_model.parameters():
+            param.requires_grad = False
+
+    if dist.is_initialized():
+        model = DistributedDataParallel(model, device_ids=[local_rank])
     
     # 数据集
     data_path = resolve_path(args.data_path)
-    dataset = DPODataset(data_path, model.processor, max_length=args.max_seq_len)
+    dataset = DPODataset(data_path, unwrap_model(model).processor, max_length=args.max_seq_len)
     
     if args.max_samples > 0 and args.max_samples < len(dataset):
         dataset = torch.utils.data.Subset(dataset, range(args.max_samples))
@@ -357,7 +367,7 @@ def train(args):
         batch_size=args.batch_size,
         sampler=sampler,
         collate_fn=dpo_collate_fn,
-        num_workers=0,
+        num_workers=args.num_workers,
         shuffle=(sampler is None)
     )
     
@@ -401,6 +411,8 @@ def train(args):
             chosen_mask = batch['chosen_mask'].to(device)
             rejected_ids = batch['rejected_ids'].to(device)
             rejected_mask = batch['rejected_mask'].to(device)
+            chosen_response_mask = batch['chosen_response_mask'].to(device)
+            rejected_response_mask = batch['rejected_response_mask'].to(device)
             
             # 处理图像相关参数（已经是 batched tensor）
             pixel_values = batch.get('pixel_values')
@@ -418,8 +430,10 @@ def train(args):
             
             loss, chosen_logps, rejected_logps = compute_dpo_loss(
                 unwrap_model(model),
+                ref_model,
                 chosen_ids, chosen_mask,
                 rejected_ids, rejected_mask,
+                chosen_response_mask, rejected_response_mask,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 mm_token_type_ids=mm_token_type_ids,
@@ -508,6 +522,9 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--use_ref_model", type=int, default=1, choices=[0, 1],
+                       help="Use a frozen reference model for standard DPO")
+    parser.add_argument("--num_workers", type=int, default=0)
     
     # 冻结
     parser.add_argument("--freeze_vision", type=int, default=1)

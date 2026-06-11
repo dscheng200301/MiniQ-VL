@@ -1,253 +1,196 @@
 # MiniQ-VL
 
-基于 **Qwen3-VL-2B-Instruct** 的多模态视觉语言模型训练框架，支持 SFT/DPO 等训练方式及多模型对比评估。
+MiniQ-VL 是一个围绕 Qwen3-VL 构建的轻量多模态训练项目，覆盖监督微调（SFT）、直接偏好优化（DPO）、组相对策略优化（GRPO）与统一评估流程。
 
----
+项目当前以图像描述任务为主要使用场景。模型结构由加载的 Hugging Face / ModelScope 检查点决定，仓库负责数据处理、LoRA 微调、偏好训练、奖励计算和评估。
+
+## 当前能力
+
+- SFT：支持 LoRA、DDP、混合精度、梯度累积、断点恢复与合并权重导出。
+- DPO：使用 chosen/rejected 偏好样本，只计算助手回答区域的序列对数概率，默认启用冻结参考模型。
+- GRPO：为每个提示独立生成多条回答，计算组内相对优势，并支持 CLIP、LLM Judge、长度及可选扩展奖励。
+- 评估：可统一比较 Base、SFT、DPO 模型，输出 CLIPScore、Self-BLEU、LLM Judge、文本长度和失败统计。
+- 测试：包含静态契约与关键训练逻辑测试。
 
 ## 项目结构
 
-```
+```text
 MiniQ-VL/
+├── dataset/
+│   ├── prepare_dpo_dataset.py
+│   ├── prepare_grpo_dataset.py
+│   └── sft_dataset.py
 ├── model/
-│   ├── __init__.py
-│   └── qwen_vl.py              # Qwen3-VL 模型封装
-├── dataset/
-│   ├── __init__.py
-│   ├── sft_dataset.py          # SFT/Pretrain 数据集处理
-│   ├── grpo_dataset.py         # GRPO 数据集
-│   ├── prepare_grpo_dataset.py # GRPO 数据预处理
-│   └── prepare_dpo_dataset.py  # DPO 数据构建
-├── trainer/
-│   ├── __init__.py
-│   ├── trainer_utils.py        # 训练工具
-│   ├── grpo_utils.py           # GRPO 工具 (Reward/CLIP)
-│   ├── dpo_utils.py            # DPO 损失函数
-│   ├── train_pretrain.py       # 预训练脚本
-│   ├── train_sft.py            # SFT 训练脚本
-│   ├── train_dpo.py            # DPO 训练脚本
-│   └── train_grpo.py           # GRPO 训练脚本
-├── utils/
-│   ├── __init__.py
-│   └── api_client.py           # 统一 LLM API 调用 (内置速率限制)
+│   └── qwen_vl.py
 ├── scripts/
-│   ├── download_eval_data.py   # 下载评估数据集
-│   ├── train_sft.sh            # SFT 启动脚本
-│   └── train_grpo.sh           # GRPO 启动脚本
-├── eval_all.py                 # ★ 综合评估脚本 (base/sft/dpo 三模型对比)
-├── out/                        # 模型权重输出
-├── eval_output/                # 评估报告输出
-├── dataset/
-│   ├── eval_images/            # 评估图像
-│   ├── sft_i2t.parquet         # SFT 训练数据
-│   └── pretrain_i2t.parquet    # Pretrain 数据
-├── requirements.txt
-├── CHANGELOG.md                # 改动日志
-└── EVALUATION.md               # 评估指南
+│   ├── download_eval_data.py
+│   ├── train_dpo.sh
+│   ├── train_grpo.sh
+│   └── train_sft.sh
+├── tests/
+├── trainer/
+│   ├── grpo_utils.py
+│   ├── train_dpo.py
+│   ├── train_grpo.py
+│   ├── train_pretrain.py
+│   └── train_sft.py
+├── utils/
+│   └── api_client.py
+└── eval_all.py
 ```
 
----
+更详细的代码结构与数据流见 [PROJECT.md](PROJECT.md)。
 
-## 模型架构
+## 环境安装
 
-| 组件 | 配置 |
-|---|---|
-| **基座模型** | Qwen3-VL-2B-Instruct |
-| **Vision Encoder** | SigLIP-2 (patch size 16×16) |
-| **特征融合** | DeepStack 多层次融合 |
-| **位置编码** | Interleaved-MRoPE (3D) |
-| **压缩比** | 32 (视觉 token 压缩) |
-| **模型加载** | `AutoModelForImageTextToText` |
-
----
-
-## 环境要求
-
-| 训练阶段 | 最低显存 | 推荐显存 | 预估时间 |
-|---|---|---|---|
-| Pretrain | 16GB | 24GB+ | 12-24h |
-| SFT | 16GB | 24GB+ | 24-48h |
-| DPO | 16GB | 24GB+ | ~1h |
-| GRPO | 24GB | 40GB+ | 8-16h |
-
-| 依赖 | 版本 |
-|---|---|
-| Python | ≥ 3.9 |
-| PyTorch | ≥ 2.5.0 |
-| transformers | ≥ 4.50.0 |
-| CUDA | ≥ 11.8 |
-
----
-
-## 快速开始
-
-### 1. 安装依赖
+建议使用 Linux、CUDA GPU 和 Python 3.10+。
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 配置环境变量
+主要依赖包括 PyTorch、Transformers、Accelerate、PEFT、PyArrow、OpenAI SDK 和 ModelScope。
 
-```bash
-# MiniMax API Key（用于 LLM Judge 和数据筛选）
-export API_KEY="your_api_key_here"
+## 准备模型与数据
 
-# Wandb（可选，用于训练可视化）
-pip install wandb
-wandb login
-export WANDB_API_KEY="your_wandb_key"
+仓库不包含模型权重与训练数据。默认路径如下：
+
+```text
+./model/Qwen3-VL-2B-Instruct
+./model/clip-vit-base-patch32
+./dataset/minimind-v_dataset/sft_i2t.parquet
+./dataset/minimind-v_dataset/dpo_i2t.json
+./dataset/minimind-v_dataset/grpo_i2t.parquet
 ```
 
-> API Key 可在 [MiniMax 开放平台](https://platform.minimaxi.com/) 注册获取。
-
-### 3. 下载模型和数据
+可使用 ModelScope 下载基础模型和数据集：
 
 ```bash
-# 基座模型
 python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwen3-VL-2B-Instruct', local_dir='./model/Qwen3-VL-2B-Instruct')"
-
-# 训练数据
 python -c "from modelscope import snapshot_download; snapshot_download('gongjy/minimind-v_dataset', local_dir='./dataset/minimind-v_dataset')"
 ```
 
-### 4. 训练
+CLIP 奖励与评估默认读取本地 `./model/clip-vit-base-patch32`，也可通过命令行参数覆盖。
+
+## 快速开始
+
+### 1. SFT
+
+Linux 下可直接运行：
 
 ```bash
-python trainer/train_sft.py              # SFT 训练
-python trainer/train_dpo.py              # DPO 训练（需要 SFT merged 模型）
+bash scripts/train_sft.sh
 ```
 
-### 5. 评估
-
-评估前准备评估图像：
+也可自行启动：
 
 ```bash
-# 下载 COCO Val2017 评估图像（推荐，约 5000 张）
+torchrun --nproc_per_node=1 trainer/train_sft.py \
+  --model_path ./model/Qwen3-VL-2B-Instruct \
+  --data_path ./dataset/minimind-v_dataset/sft_i2t.parquet \
+  --use_lora 1
+```
+
+默认会将训练权重写入 `./out`；启用 LoRA 合并时，还会生成可直接加载的合并模型目录。
+
+### 2. 准备并运行 DPO
+
+`dataset/prepare_dpo_dataset.py` 当前仍使用脚本内硬编码路径、采样数量和 API 配置。首次使用前请先修改脚本顶部相关常量，再执行：
+
+```bash
+python dataset/prepare_dpo_dataset.py
+bash scripts/train_dpo.sh
+```
+
+直接运行示例：
+
+```bash
+torchrun --nproc_per_node=1 trainer/train_dpo.py \
+  --model_path ./model/Qwen3-VL-2B-Instruct \
+  --sft_checkpoint ./out/sft_vlm_merged \
+  --data_path ./dataset/minimind-v_dataset/dpo_i2t.json \
+  --use_ref_model 1
+```
+
+DPO 默认加载冻结参考模型，因此显存占用会明显高于 SFT。
+
+### 3. 准备并运行 GRPO
+
+生成关键词过滤后的训练集：
+
+```bash
+python dataset/prepare_grpo_dataset.py \
+  --src ./dataset/minimind-v_dataset/sft_i2t.parquet \
+  --dst ./dataset/minimind-v_dataset/grpo_i2t.parquet
+```
+
+启动训练：
+
+```bash
+bash scripts/train_grpo.sh
+```
+
+GRPO 会为每个提示生成 `group_size` 条回答。启用 LLM Judge、参考模型或较大生成组时，训练成本会显著增加。
+
+### 4. 评估模型
+
+下载 COCO Val2017 评估图像：
+
+```bash
 python scripts/download_eval_data.py
-
-# 或准备自定义图像，放入 ./dataset/eval_images/
-mkdir -p ./dataset/eval_images/
-# 将图像放入此目录
 ```
 
-评估：
+比较 Base、SFT 和 DPO：
 
 ```bash
-# 三模型对比评估 (base / sft / dpo)
-python eval_all.py --mode all --max_samples 30
-
-# 快速评估 (跳过 LLM Judge API 调用)
-python eval_all.py --mode all --max_samples 30 --no_judge
-
-# 仅评估单个模型
-python eval_all.py --mode base --max_samples 30
+python eval_all.py \
+  --mode all \
+  --base_model_path ./model/Qwen3-VL-2B-Instruct \
+  --sft_checkpoint ./out/sft_vlm_merged \
+  --dpo_checkpoint ./out/dpo_<timestamp>/dpo_final.pt \
+  --image_dir ./dataset/eval_images \
+  --max_samples 100
 ```
 
----
+请显式传入当前 DPO 检查点路径，避免使用脚本中的历史时间戳默认值。评估报告默认保存到：
 
-## 评估系统
-
-`eval_all.py` 是核心评估脚本，支持对基座/SFT/DPO 三种模型在同一套图像上对比。
-
-### 评估指标
-
-| 指标 | 说明 |
-|---|---|
-| **CLIPScore** | 生成描述与图像的语义对齐度 |
-| **LLM-Judge** | 5 维度结构化评分 (物体识别/属性描述/空间关系/场景氛围/语言流畅度) |
-| **Self-BLEU** | 生成多样性 (需 `--num_samples > 1`) |
-| **描述长度** | 平均生成长度 |
-| **失败类型统计** | 未识别/幻觉/过短/属性缺失等 |
-
-### 常用参数
-
-```
-python eval_all.py --mode all \
-    --max_samples 30 \           # 评估图像数量
-    --temperature 0.7 \          # 生成温度 (0=贪婪解码, 更快)
-    --no_judge \                 # 跳过 LLM Judge (大幅加速)
-    --no_clip                    # 跳过 CLIPScore (略加速)
+```text
+./eval_output/comprehensive_<timestamp>/
 ```
 
-### 输出文件
-
-```
-eval_output/comprehensive_YYYYMMDD_HHMMSS/
-├── report.md                   # ★ 完整可读报告 (含结果分析)
-├── comparison_report.md        # 维度对比表
-├── results.json                # 汇总指标
-├── per_sample_base.jsonl       # base 每张图的描述
-├── per_sample_sft.jsonl        # sft 每张图的描述
-└── per_sample_dpo.jsonl        # dpo 每张图的描述
-```
-
-> `report.md` 包含自动结果分析：CLIPScore 对比、描述长度变化趋势、薄弱维度诊断、训练阶段有效性判断、后续优化建议。
-
----
+完整评估说明见 [EVALUATION.md](EVALUATION.md)。
 
 ## API 配置
 
-项目使用 `utils/api_client.py` 统一管理所有 LLM API 调用，默认使用 **MiniMax** 接口。
-
-| 配置项 | 默认值 | 说明 |
-|---|---|---|
-| 模型 | `MiniMax-M2.7-highspeed` | Judge / 数据筛选共用 |
-| Endpoint | `https://api.minimaxi.com/v1` | API Base URL |
-| RPM | 500 | 每分钟请求数限制 |
-| TPM | 20,000,000 | 每分钟 Token 数限制 |
-| thinking | 已禁用 | 确保 JSON 格式输出 |
-
-如需切换 API 服务商：
+LLM Judge 与部分数据构造流程使用兼容 OpenAI SDK 的接口：
 
 ```bash
-python eval_all.py --mode all \
-    --judge_model gpt-4o \
-    --judge_api_key sk-xxx \
-    --judge_base_url https://api.openai.com/v1
+export API_KEY="your-api-key"
+export OPENAI_BASE_URL="https://api.minimaxi.com/v1"
 ```
 
----
+也支持 `OPENAI_API_KEY`。默认 Judge 模型为 `MiniMax-M2.7-highspeed`，可通过对应命令行参数覆盖。
 
-## 模型路径
+## 验证
 
-| 模型类型 | 示例路径 | 加载方式 |
-|---|---|---|
-| Base (基座) | `./model/Qwen3-VL-2B-Instruct` | 直接加载完整目录 |
-| SFT (Merged) | `./out/sft_vlm_merged` | 直接加载完整目录 |
-| DPO (.pt) | `./out/dpo_xxx/dpo_final.pt` | 先加载 base 再载入 .pt 权重 |
+```bash
+python -m pytest tests -q
+python -m compileall model trainer dataset utils eval_all.py
+```
 
-`eval_all.py` 自动处理三种路径格式：目录按 merged 模型加载，`.pt` 文件走 checkpoint 加载。
+涉及真实模型、GPU、外部 API 的流程仍应在目标环境中进行小规模冒烟测试。
 
----
+## 已知限制
 
-## 训练参数
+- 仓库不分发模型、数据集和 CLIP 权重。
+- DPO 数据准备脚本尚未提供完整 CLI，使用前需要修改硬编码配置。
+- 训练器中存在面向具体入口的内嵌数据集实现，行为应以实际运行的训练入口为准。
+- GRPO 的多次生成、CLIP 奖励、LLM Judge 和可选参考模型都会提高时间与显存成本。
+- `train_pretrain.py` 已提供预训练入口，但目前没有配套启动脚本，集成度低于 SFT、DPO 和 GRPO。
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--model_path` | ./model/Qwen3-VL-2B-Instruct | 模型路径 |
-| `--data_path` | ./dataset/sft_i2t.parquet | 数据路径 |
-| `--epochs` | 2 | 训练轮数 |
-| `--batch_size` | 1 | batch size |
-| `--learning_rate` | 1e-5 | 学习率 |
-| `--freeze_vision` | 1 | 冻结视觉编码器 |
-| `--use_wandb` | 1 | 使用 wandb |
+## 进一步阅读
 
-### GRPO/DPO 参数
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--group_size` | 4 | 每个 prompt 采样数 |
-| `--temperature` | 0.8 | 采样温度 |
-| `--w1` | 0.3 | CLIPScore 权重 |
-| `--w2` | 0.5 | LLM-Judge 权重 |
-| `--w3` | 0.2 | Length Penalty 权重 |
-| `--clip_eps` | 0.2 | GRPO clip 范围 |
-| `--clip_model` | ./model/clip-vit-base-patch32 | CLIP 本地路径 |
-
----
-
-## 参考项目
-
-- [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL)
-- [MiniMind-V](https://github.com/jingyaogong/minimind-v)
-- [transformers](https://github.com/huggingface/transformers)
+- [PROJECT.md](PROJECT.md)：架构、模块职责和数据契约
+- [EVALUATION.md](EVALUATION.md)：评估命令、指标与报告
+- [OPTIMIZATION.md](OPTIMIZATION.md)：优化路线和实验建议
+- [CHANGELOG.md](CHANGELOG.md)：近期修复与变更

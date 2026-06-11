@@ -15,6 +15,7 @@ import warnings
 import random
 import math
 import traceback
+import itertools
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -166,13 +167,6 @@ def resolve_path(path):
 
 def get_lr(current_step, total_steps, lr):
     return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
-
-
-def setup_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 def init_distributed_mode():
@@ -413,7 +407,10 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
         )
 
-    for step, batch in enumerate(loader, start=start_step + 1):
+    remaining_loader = itertools.islice(loader, start_step, None)
+    last_step = start_step
+    for step, batch in enumerate(remaining_loader, start=start_step + 1):
+        last_step = step
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -522,7 +519,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             os.makedirs(save_dir, exist_ok=True)
             model_to_save = model.module if isinstance(model, DistributedDataParallel) else model
             if args.use_lora:
-                model_to_save.save_pretrained(save_dir)
+                model_to_save.model.save_pretrained(save_dir)
             else:
                 model_to_save.model.save_pretrained(save_dir)
             if hasattr(model_to_save, 'processor') and model_to_save.processor is not None:
@@ -559,6 +556,13 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
 
         # 清理显存
         del input_ids, attention_mask, labels, pixel_values, outputs, loss
+
+    if last_step > start_step and last_step % args.accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
 
     # 关闭进度条
     if pbar is not None:
@@ -699,10 +703,6 @@ def main():
         except Exception as e:
             print(f"Warning: Could not enable gradient checkpointing: {e}")
 
-    # DDP
-    if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
-
     # LoRA 训练
     if args.use_lora:
         try:
@@ -728,16 +728,10 @@ def main():
 
             # 应用 LoRA
             inner = model.module if isinstance(model, DistributedDataParallel) else model
-            model_peft = get_peft_model(inner, lora_config)
-
-            # 替换原 model 引用
-            if isinstance(model, DistributedDataParallel):
-                model.module = model_peft
-            else:
-                model = model_peft
+            inner.model = get_peft_model(inner.model, lora_config)
 
             if is_main_process():
-                model_peft.print_trainable_parameters()
+                inner.model.print_trainable_parameters()
                 print(f"LoRA applied with rank={args.lora_r}, alpha={args.lora_alpha}, "
                       f"target_modules={target_modules}")
 
@@ -745,6 +739,10 @@ def main():
             print("Warning: peft not installed. Run: pip install peft")
             print("Falling back to full fine-tuning")
             args.use_lora = 0
+
+    # DDP must wrap the final parameter set, including injected LoRA weights.
+    if dist.is_initialized():
+        model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # 统计参数
     if is_main_process():
@@ -901,17 +899,17 @@ def main():
 
         if args.use_lora:
             # 保存 LoRA 适配器
-            model_to_save.save_pretrained(final_dir)
+            model_to_save.model.save_pretrained(final_dir)
             print(f"Saved LoRA adapter to {final_dir}")
 
             # 可选：合并 LoRA 权重到基础模型并保存
             if args.lora_merge_and_save:
                 merged_dir = final_dir + "_merged"
                 os.makedirs(merged_dir, exist_ok=True)
-                merged_model = model_to_save.merge_and_unload()
-                merged_model.model.save_pretrained(merged_dir)
-                if hasattr(merged_model, 'processor') and merged_model.processor is not None:
-                    merged_model.processor.save_pretrained(merged_dir)
+                merged_model = model_to_save.model.merge_and_unload()
+                merged_model.save_pretrained(merged_dir)
+                if model_to_save.processor is not None:
+                    model_to_save.processor.save_pretrained(merged_dir)
                 print(f"Saved merged model to {merged_dir}")
         else:
             model_to_save.model.save_pretrained(final_dir)

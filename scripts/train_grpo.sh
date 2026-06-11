@@ -14,7 +14,7 @@
 set -euo pipefail
 
 # ============== 项目路径 ==============
-PROJECT_DIR="/root/autodl-tmp/MiniQ-VL"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR" || { echo "项目目录不存在: $PROJECT_DIR"; exit 1; }
 
 # ============== 默认参数 ==============
@@ -114,16 +114,6 @@ export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 # ============== 启动前环境检查 ==============
 echo "[Pre-check] 残留进程与显存状态:"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader || true
-# 杀掉上一次 GRPO 残留 (不影响其它用户进程)
-if pgrep -af "train_grpo.py" >/dev/null 2>&1; then
-  echo "[Pre-check] 发现残留 GRPO 进程, 清理中..."
-  pkill -9 -f "train_grpo.py" 2>/dev/null || true
-fi
-if pgrep -af "torchrun.*train_grpo" >/dev/null 2>&1; then
-  pkill -9 -f "torchrun.*train_grpo" 2>/dev/null || true
-fi
-sleep 1
-
 # ============== 准备 GRPO 筛选数据集 (关键词匹配) ==============
 # 若 PREFILTERED_PATH 不存在 且 PREPARE_DATASET=1, 自动跑一次 prepare
 if [[ "$PREPARE_DATASET" == "1" ]]; then
